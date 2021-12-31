@@ -1,15 +1,18 @@
+#include <Wire.h>
 #include <Ultrasonic.h>
 #include <Servo.h>
+#include "I2Cdev.h"
 //#include <MPU6050.h>
 //#include <Adafruit_PWMServoDriver.h>
 //Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
-//#include "MPU6050_6Axis_MotionApps20.h"
+#include "MPU6050_6Axis_MotionApps20.h"
 #include "Wire.h"
 #include <LiquidCrystal_I2C.h>
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Ultrasonic ultrasonic(35, 37);
-//MPU6050 mpu(0x68);
 // define for multi
+#define Time millis()
+#define battery A15
 #define A 48
 #define B 46
 #define C 44
@@ -30,12 +33,42 @@ Ultrasonic ultrasonic(35, 37);
 //for led on shild
 //#define led1 A7
 //#define led2 A8
+MPU6050 mpu;
+#define OUTPUT_READABLE_YAWPITCHROLL
 
+#define INTERRUPT_PIN 2  // use pin 2 on Arduino Uno & most boards
+#define LED_PIN 13 // (Arduino is 13, Teensy is 11, Teensy++ is 6)
+bool blinkState = false;
+
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+
+// packet structure for InvenSense teapot demo
+uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
 //sw dip on shild ;
 int sw = A2;
 class starter_vars {
   public:
-    
+
     //srf
     int dis;
     //for tcrt
@@ -56,6 +89,20 @@ class starter_vars {
     int halat, degree;
     int Speed;
 } robot_var;
+int battery_level(){
+  int level = map(analogRead(battery), 820, 900, 0, 100);
+  if (level <0){
+    level = 0;
+  }
+  if (level >100){
+    level = 100;
+  }
+  Serial.print("battery charge: ");
+  Serial.print(level);
+  Serial.println("%");
+  lcd_print(0, 0, level);
+  return level;
+}
 void motor(int pwm1, int pwm2) {
   // pwm1 for left motors
   // pwm2 for right motors
@@ -356,9 +403,103 @@ void chop(double adad, int dopom  ) //dopom=delay of Print on monitor
     Serial.print("/t");
   }
 }
-void setup() {
+int mpu6050(){
+      // if programming failed, don't try to do anything
+    if (!dmpReady) return;
+    // read a packet from FIFO
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) { // Get the Latest packet 
+        #ifdef OUTPUT_READABLE_QUATERNION
+            // display quaternion values in easy matrix form: w x y z
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            Serial.print("quat\t");
+            Serial.print(q.w);
+            Serial.print("\t");
+            Serial.print(q.x);
+            Serial.print("\t");
+            Serial.print(q.y);
+            Serial.print("\t");
+            Serial.println(q.z);
+        #endif
 
-  Wire.begin();
+        #ifdef OUTPUT_READABLE_EULER
+            // display Euler angles in degrees
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetEuler(euler, &q);
+            Serial.print("euler\t");
+            Serial.print(euler[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(euler[1] * 180/M_PI);
+            Serial.print("\t");
+            Serial.println(euler[2] * 180/M_PI);
+        #endif
+
+        #ifdef OUTPUT_READABLE_YAWPITCHROLL
+            // display Euler angles in degrees
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+            Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/M_PI);
+            Serial.print("\t");
+            Serial.println(ypr[2] * 180/M_PI);
+        #endif
+
+        #ifdef OUTPUT_READABLE_REALACCEL
+            // display real acceleration, adjusted to remove gravity
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetAccel(&aa, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+            Serial.print("areal\t");
+            Serial.print(aaReal.x);
+            Serial.print("\t");
+            Serial.print(aaReal.y);
+            Serial.print("\t");
+            Serial.println(aaReal.z);
+        #endif
+
+        #ifdef OUTPUT_READABLE_WORLDACCEL
+            // display initial world-frame acceleration, adjusted to remove gravity
+            // and rotated based on known orientation from quaternion
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetAccel(&aa, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+            mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
+            Serial.print("aworld\t");
+            Serial.print(aaWorld.x);
+            Serial.print("\t");
+            Serial.print(aaWorld.y);
+            Serial.print("\t");
+            Serial.println(aaWorld.z);
+        #endif
+    
+        #ifdef OUTPUT_TEAPOT
+            // display quaternion values in InvenSense Teapot demo format:
+            teapotPacket[2] = fifoBuffer[0];
+            teapotPacket[3] = fifoBuffer[1];
+            teapotPacket[4] = fifoBuffer[4];
+            teapotPacket[5] = fifoBuffer[5];
+            teapotPacket[6] = fifoBuffer[8];
+            teapotPacket[7] = fifoBuffer[9];
+            teapotPacket[8] = fifoBuffer[12];
+            teapotPacket[9] = fifoBuffer[13];
+            Serial.write(teapotPacket, 14);
+            teapotPacket[11]++; // packetCount, loops at 0xFF on purpose
+        #endif
+
+        // blink LED to indicate activity
+        blinkState = !blinkState;
+        digitalWrite(LED_PIN, blinkState);
+      return ypr[0] * 180/M_PI;
+    }
+    
+}
+void setup() {
+  //battery
+  pinMode(battery,INPUT);
   //MULTI
   pinMode(A, OUTPUT);
   pinMode(B, OUTPUT);
@@ -368,7 +509,7 @@ void setup() {
   line_board.bPin = B;
   line_board.cPin = C;
   line_board.dPin = D;
-  
+
   // DRIVER 1
   pinMode(i1, OUTPUT);
   pinMode(i2, OUTPUT);
@@ -387,59 +528,71 @@ void setup() {
   lcd.init();
   lcd.backlight();
   //  gy521
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-  Wire.begin();
-  TWBR = 48; // 400kHz I2C clock (200kHz if CPU is 8MHz)
-#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-  Fastwire::setup(400, true);
-#endif
   Serial.begin(9600);
-  //  mpu.initialize();
-  //  Serial.println(mpu.testConnection() ? F("MPU6050 connection test successed ") : F("MPU6050 connection test failed"));
-  //  deviceStatus = mpu.dmpInitialize();
-  /////////////Offsets/////////////
-  //  mpu.setXGyroOffset(20);
-  //  mpu.setYGyroOffset(-41);
-  //  mpu.setZGyroOffset(48);
-  //  mpu.setXAccelOffset(-3729);
-  //  mpu.setYAccelOffset(3067);
-  //  mpu.setZAccelOffset(1704);
-  /////////////////////////////////
-  if (robot_var.deviceStatus == 0)
-  {
-    Serial.println("DMP initialization success, now enable DMP for use");
-    //    mpu.setDMPEnabled(true);
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+        Wire.begin();
+        //Wire.setClock(400000); // 400kHz I2C clock. Comment this line if having compilation difficulties
+    #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+        Fastwire::setup(400, true);
+    #endif
+    Serial.println(F("Initializing I2C devices..."));
+    mpu.initialize();
+    pinMode(INTERRUPT_PIN, INPUT);
 
-    //wait for first interrupt . currently just leave it false automatically
-    robot_var.dmpReady = true;
-    Serial.println("DMP is ready to use.");
-    //    packetSize = mpu.dmpGetFIFOPacketSize();
-  }
-  else
-  {
-    //ERROR! , device status !=0 when initializing DMP
-    Serial.print("DMP initialization failed when using MPU6050 library:");
-    if (robot_var.deviceStatus == 1)
-      Serial.println(" intial memory load failed");
-    else if (robot_var.deviceStatus == 2)
-      Serial.println(" failed to update DMP configuration");
-    else
-    {
-      Serial.print(" unknow error with code: ");
-      Serial.println(robot_var.deviceStatus);
+    // verify connection
+    Serial.println(F("Testing device connections..."));
+
+    // load and configure the DMP
+    Serial.println(F("Initializing DMP..."));
+    devStatus = mpu.dmpInitialize();
+
+    // supply your own gyro offsets here, scaled for min sensitivity
+    mpu.setXGyroOffset(95);
+    mpu.setYGyroOffset(-9);
+    mpu.setZGyroOffset(-44.5);
+    mpu.setZAccelOffset(913.5); // 1688 factory default for my test chip
+
+    // make sure it worked (returns 0 if so)
+    if (devStatus == 0) {
+        // Calibration Time: generate offsets and calibrate our MPU6050
+        mpu.CalibrateAccel(6);
+        mpu.CalibrateGyro(6);
+        mpu.PrintActiveOffsets();
+        // turn on the DMP, now that it's ready
+        Serial.println(F("Enabling DMP..."));
+        mpu.setDMPEnabled(true);
+
+        // enable Arduino interrupt detection
+        Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+        Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+        Serial.println(F(")..."));
+        attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+        mpuIntStatus = mpu.getIntStatus();
+
+        // set our DMP Ready flag so the main loop() function knows it's okay to use it
+        Serial.println(F("DMP ready! Waiting for first interrupt..."));
+        dmpReady = true;
+
+        // get expected DMP packet size for later comparison
+        packetSize = mpu.dmpGetFIFOPacketSize();
+    } else {
+        // ERROR!
+        // 1 = initial memory load failed
+        // 2 = DMP configuration updates failed
+        // (if it's going to break, usually the code will be 1)
+        Serial.print(F("DMP Initialization failed (code "));
+        Serial.print(devStatus);
+        Serial.println(F(")"));
     }
-  }
-  //for led
-  //  pinMode(led1, OUTPUT);
-  //  pinMode(led2, OUTPUT);
-  //for servo
-  //  pwm.begin();
-  //  pwm.setPWMFreq(50);
+
+    // configure LED for output
+    pinMode(LED_PIN, OUTPUT);
 }
 void loop()
 {
   line(100);
-  lcd_print(0, 0, line_board.Digital[5]);
-  lcd_print(0, 1, line_board.Digital[11]);
+  battery_level();
+  delay(10);
+  lcd.clear();
   Serial.print("left ") , Serial.print(line_board.Digital[11]) , Serial.print("middle ") , Serial.print(line_board.Digital[8]), Serial.print("right ") , Serial.println(line_board.Digital[5]);
 }
